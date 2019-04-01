@@ -57,10 +57,10 @@ namespace Reminiscence.Arrays
         /// Gets or sets the unmanaged pointer to the first element in the array.  If the array is
         /// empty (i.e., <see cref="LengthCore"/> is 0), then this value may be undefined.
         /// </summary>
-        protected T* HeadPointer
+        protected internal T* HeadPointer
         {
             get => this.head;
-            set => this.head = value;
+            protected set => this.head = value;
         }
 
         /// <summary>
