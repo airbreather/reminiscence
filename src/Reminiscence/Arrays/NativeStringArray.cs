@@ -159,7 +159,7 @@ namespace Reminiscence.Arrays
 
             if (this.RepackBeforeSaving)
             {
-                var fileStream = new FileStream(Path.Combine(Path.GetTempPath(), Path.GetRandomFileName()), FileMode.Create, FileAccess.ReadWrite, FileShare.ReadWrite, 4096, FileOptions.DeleteOnClose);
+                using (var fileStream = new FileStream(Path.Combine(Path.GetTempPath(), Path.GetRandomFileName()), FileMode.Create, FileAccess.ReadWrite, FileShare.ReadWrite, 4096, FileOptions.DeleteOnClose))
                 using (var scratch = new NativeMemoryMappedArray<byte>(fileStream))
                 {
                     this.Repack(scratch);
