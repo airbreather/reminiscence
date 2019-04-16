@@ -39,8 +39,7 @@ namespace Reminiscence.Arrays
             get
             {
                 // handle non-negative and out-of-bounds with a single test
-                long length = this.Length;
-                if (unchecked((ulong)idx >= (ulong)length))
+                if (unchecked((ulong)idx >= (ulong)this.Length))
                 {
                     ThrowArgumentOutOfRangeExceptionForIndex();
                 }
@@ -57,8 +56,31 @@ namespace Reminiscence.Arrays
                 return str;
             }
 
-            // TODO: tack onto the end of the data block, resizing if needed.
-            set => throw new NotImplementedException();
+            set
+            {
+                // handle non-negative and out-of-bounds with a single test
+                if (unchecked((ulong)idx >= (ulong)this.Length))
+                {
+                    ThrowArgumentOutOfRangeExceptionForIndex();
+                }
+
+                var ptr = this.pointers[idx];
+                int neededByteLength = UTF8Encoding_NoBOM_ThrowOnInvalid.GetByteCount(value);
+                if (neededByteLength > ptr.ByteLength)
+                {
+                    throw new NotImplementedException("still need to write the code to find a free block in the data array.");
+                }
+                else
+                {
+                    byte* dataStart = &this.data.HeadPointer[ptr.ByteOffset];
+                    fixed (char* c = value)
+                    {
+                        ptr.ByteLength = UTF8Encoding_NoBOM_ThrowOnInvalid.GetBytes(c, value.Length, dataStart, ptr.ByteLength);
+                    }
+
+                    this.pointers[idx] = ptr;
+                }
+            }
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
@@ -128,7 +150,8 @@ namespace Reminiscence.Arrays
 
             if (this.RepackBeforeSaving)
             {
-                using (var scratch = new NativeMemoryArray<byte>(DefaultUnmanagedMemoryAllocator.Instance, this.data.Length))
+                var fileStream = new FileStream(Path.Combine(Path.GetTempPath(), Path.GetRandomFileName()), FileMode.Create, FileAccess.ReadWrite, FileShare.ReadWrite, 4096, FileOptions.DeleteOnClose);
+                using (var scratch = new NativeMemoryMappedArray<byte>(fileStream))
                 {
                     this.Repack(scratch);
                 }

@@ -36,8 +36,8 @@ namespace Reminiscence.Arrays
         /// (with length 0).
         /// </param>
         public NativeMemoryMappedArray(string fileName)
+            : this(new FileStream(fileName, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite))
         {
-            this.fileStream = new FileStream(fileName, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite);
             try
             {
                 this.Initialize();
@@ -64,8 +64,8 @@ namespace Reminiscence.Arrays
         /// The number of elements in the array.
         /// </param>
         public NativeMemoryMappedArray(string fileName, long byteOffset, long length)
+            : this(new FileStream(fileName, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite))
         {
-            this.fileStream = new FileStream(fileName, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
             try
             {
                 if (byteOffset < 0)
@@ -93,6 +93,8 @@ namespace Reminiscence.Arrays
                 throw;
             }
         }
+
+        internal NativeMemoryMappedArray(FileStream fileStream) => this.fileStream = fileStream;
 
         /// <summary>
         /// Finalizes an instance of the <see cref="NativeMemoryMappedArray{T}"/> class.
