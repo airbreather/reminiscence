@@ -47,6 +47,11 @@ namespace Reminiscence.Arrays
                 var ptr = this.pointers[idx];
                 byte* data = &this.data.HeadPointer[ptr.ByteOffset];
                 int charCount = UTF8Encoding_NoBOM_ThrowOnInvalid.GetCharCount(data, ptr.ByteLength);
+                if (charCount == 0)
+                {
+                    return string.Empty;
+                }
+
                 string str = new string('\0', charCount);
                 fixed (char* c = str)
                 {
@@ -58,6 +63,11 @@ namespace Reminiscence.Arrays
 
             set
             {
+                if (value is null)
+                {
+                    value = string.Empty;
+                }
+
                 // handle non-negative and out-of-bounds with a single test
                 if (unchecked((ulong)idx >= (ulong)this.Length))
                 {
@@ -65,20 +75,19 @@ namespace Reminiscence.Arrays
                 }
 
                 var ptr = this.pointers[idx];
-                int neededByteLength = UTF8Encoding_NoBOM_ThrowOnInvalid.GetByteCount(value);
-                if (neededByteLength > ptr.ByteLength)
+                fixed (char* c = value)
                 {
-                    throw new NotImplementedException("still need to write the code to find a free block in the data array.");
-                }
-                else
-                {
-                    byte* dataStart = &this.data.HeadPointer[ptr.ByteOffset];
-                    fixed (char* c = value)
+                    int neededByteLength = UTF8Encoding_NoBOM_ThrowOnInvalid.GetByteCount(c, value.Length);
+                    if (neededByteLength > ptr.ByteLength)
                     {
-                        ptr.ByteLength = UTF8Encoding_NoBOM_ThrowOnInvalid.GetBytes(c, value.Length, dataStart, ptr.ByteLength);
+                        throw new NotImplementedException("still need to write the code to find a free block in the data array.");
                     }
-
-                    this.pointers[idx] = ptr;
+                    else
+                    {
+                        byte* dataStart = &this.data.HeadPointer[ptr.ByteOffset];
+                        ptr.ByteLength = UTF8Encoding_NoBOM_ThrowOnInvalid.GetBytes(c, value.Length, dataStart, ptr.ByteLength);
+                        this.pointers[idx] = ptr;
+                    }
                 }
             }
         }
