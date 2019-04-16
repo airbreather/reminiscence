@@ -1,33 +1,32 @@
 ﻿#if SUPPORTS_NATIVE_MEMORY_ARRAY
 using System;
-using System.Buffers.Binary;
+using System.IO;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 
 namespace Reminiscence.Arrays
 {
-    // data format is 8 bytes for little-endian i64 for the length n, then n 12-byte pairs of
-    // (i64 offset, i32 length), each of which represents the location (relative to the start of the
-    // data block, in bytes) of the data for the string at that index.  the remaining bytes contain
-    // the data block.
     public sealed class NativeStringArray : ArrayBase<string>
     {
-        private static readonly UTF8Encoding UTF8NoBOM = new UTF8Encoding();
+        private static readonly UTF8Encoding UTF8Encoding_NoBOM_ThrowOnInvalid = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
+        private readonly NativeMemoryArrayBase<StringPointer> pointers;
 
         private readonly NativeMemoryArrayBase<byte> data;
 
-        private readonly long byteOffsetToStringData;
-
         private bool disposed;
 
-        public NativeStringArray(NativeMemoryArrayBase<byte> data)
-            : this(data ?? throw new ArgumentNullException(nameof(data)), validate: true)
+        public NativeStringArray(NativeMemoryArrayBase<StringPointer> pointers, NativeMemoryArrayBase<byte> data)
+            : this(pointers ?? throw new ArgumentNullException(nameof(pointers)),
+                   data ?? throw new ArgumentNullException(nameof(data)),
+                   validate: true)
         {
         }
 
-        private NativeStringArray(NativeMemoryArrayBase<byte> data, bool validate)
+        private unsafe NativeStringArray(NativeMemoryArrayBase<StringPointer> pointers, NativeMemoryArrayBase<byte> data, bool validate)
         {
+            this.pointers = pointers;
             this.data = data;
             if (validate)
             {
@@ -46,21 +45,32 @@ namespace Reminiscence.Arrays
                     ThrowArgumentOutOfRangeExceptionForIndex();
                 }
 
-                var ptrsStart = (StringPointer*)(this.data.HeadPointer + sizeof(long));
-                var dataStart = (byte*)&ptrsStart[length];
-                var stringPointer = Unsafe.ReadUnaligned<StringPointer>(&ptrsStart[idx]);
-                return UTF8NoBOM.GetString(&dataStart[stringPointer.ByteOffset], stringPointer.ByteLength);
+                var ptr = this.pointers[idx];
+                byte* data = &this.data.HeadPointer[ptr.ByteOffset];
+                int charCount = UTF8Encoding_NoBOM_ThrowOnInvalid.GetCharCount(data, ptr.ByteLength);
+                string str = new string('\0', charCount);
+                fixed (char* c = str)
+                {
+                    UTF8Encoding_NoBOM_ThrowOnInvalid.GetChars(data, ptr.ByteLength, c, charCount);
+                }
+
+                return str;
             }
 
             // TODO: tack onto the end of the data block, resizing if needed.
             set => throw new NotImplementedException();
         }
 
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static void ThrowArgumentOutOfRangeExceptionForIndex() => throw new ArgumentOutOfRangeException("idx", "Must be non-negative and less than the size of the array.");
+
         /// <inheritdoc />
-        public unsafe override long Length => BinaryPrimitives.ReadInt64LittleEndian(new ReadOnlySpan<byte>(this.data.HeadPointer, sizeof(long)));
+        public override long Length => this.pointers.Length;
 
         /// <inheritdoc />
         public override bool CanResize => true;
+
+        public bool RepackBeforeSaving { get; set; }
 
         /// <inheritdoc />
         public override void Dispose()
@@ -70,12 +80,13 @@ namespace Reminiscence.Arrays
                 return;
             }
 
+            this.pointers.Dispose();
             this.data.Dispose();
             this.disposed = true;
         }
 
         /// <inheritdoc />
-        public override void Resize(long size) => throw new NotImplementedException();
+        public override void Resize(long size) => this.pointers.Resize(size);
 
         public unsafe void Repack(NativeMemoryArrayBase<byte> scratch)
         {
@@ -83,90 +94,104 @@ namespace Reminiscence.Arrays
             scratch.CopyFrom(this.data);
             try
             {
-                long length = this.Length;
-                var src = new NativeStringArray(this.data, false);
-                var srcPointersStart = (StringPointer*)(src.data.HeadPointer + sizeof(long));
-                var srcStringDataStart = (byte*)&srcPointersStart[length];
-                var tgtPointersStart = (StringPointer*)(this.data.HeadPointer + sizeof(long));
-                var tgtStringDataStart = (byte*)&tgtPointersStart[length];
-                var nextStringDataStart = tgtStringDataStart;
-                for (long i = 0; i < length; i++)
+                byte* tgtPtr = this.data.HeadPointer;
+                for (long i = 0, cnt = this.Length; i < cnt; i++)
                 {
-                    var srcPointer = srcPointersStart[i];
-                    var srcStringData = new ReadOnlySpan<byte>(&srcStringDataStart[srcPointer.ByteOffset], srcPointer.ByteLength);
-                    var tgtStringData = new Span<byte>(nextStringDataStart, srcPointer.ByteLength);
-                    srcStringData.CopyTo(tgtStringData);
-                    tgtPointersStart[i].ByteOffset = nextStringDataStart - tgtStringDataStart;
-                    nextStringDataStart += srcPointer.ByteLength;
+                    var ptr = this.pointers[i];
+                    var src = new ReadOnlySpan<byte>(scratch.HeadPointer + ptr.ByteOffset, ptr.ByteLength);
+                    var tgt = new Span<byte>(tgtPtr, ptr.ByteLength);
+                    src.CopyTo(tgt);
+
+                    ptr.ByteOffset = tgtPtr - this.data.HeadPointer;
+                    this.pointers[i] = ptr;
+
+                    tgtPtr += ptr.ByteLength;
                 }
 
-                this.data.Resize(nextStringDataStart - this.data.HeadPointer);
+                this.data.Resize(tgtPtr - this.data.HeadPointer);
             }
             catch
             {
                 this.data.Resize(scratch.Length);
                 this.data.CopyFrom(scratch);
+                throw;
             }
+        }
+
+        /// <inheritdoc />
+        public override long CopyTo(Stream stream)
+        {
+            if (stream == null)
+            {
+                throw new ArgumentNullException(nameof(stream));
+            }
+
+            if (this.RepackBeforeSaving)
+            {
+                using (var scratch = new NativeMemoryArray<byte>(DefaultUnmanagedMemoryAllocator.Instance, this.data.Length))
+                {
+                    this.Repack(scratch);
+                }
+            }
+
+            long result = 0;
+
+            result += this.pointers.CopyTo(stream);
+
+            byte[] dataLengthBytes = BitConverter.GetBytes(this.data.Length);
+            stream.Write(dataLengthBytes, 0, sizeof(long));
+            result += sizeof(long);
+
+            result += this.data.CopyTo(stream);
+
+            return result;
+        }
+
+        /// <inheritdoc />
+        public override void CopyFrom(Stream stream)
+        {
+            if (stream == null)
+            {
+                throw new ArgumentNullException(nameof(stream));
+            }
+
+            this.pointers.CopyFrom(stream);
+
+            byte[] dataLengthBytes = new byte[sizeof(long)];
+            int off = 0;
+            while (off < dataLengthBytes.Length)
+            {
+                int cur = stream.Read(dataLengthBytes, off, dataLengthBytes.Length - off);
+                if (cur == 0)
+                {
+                    throw new EndOfStreamException();
+                }
+
+                off += cur;
+            }
+
+            this.data.Resize(BitConverter.ToInt64(dataLengthBytes, 0));
+            this.data.CopyFrom(stream);
+            this.Validate();
         }
 
         private unsafe void Validate()
         {
-            if (!this.data.CanResize)
+            for (long i = 0; i < this.pointers.Length; i++)
             {
-                throw new NotSupportedException("Even a native string array with a fixed length still needs the underlying block to be resizable, to ensure that we can replace the string at a particular index with a longer one.");
-            }
-
-            if (this.data.Length == 0)
-            {
-                return;
-            }
-
-            if (this.data.Length < sizeof(long))
-            {
-                throw new ArgumentException();
-            }
-
-            var head = this.data.HeadPointer;
-            if (this.Length < 0)
-            {
-                throw new ArgumentException();
-            }
-
-            var ptrsStart = (StringPointer*)(head + sizeof(long));
-            var ptrsEnd = ptrsStart + this.Length;
-            if (this.Length < (ptrsEnd - ptrsStart))
-            {
-                throw new ArgumentException();
-            }
-
-            long endOfStringData = 0;
-            for (StringPointer* cur = ptrsStart; cur < ptrsEnd; cur++)
-            {
-                if (cur->ByteOffset < 0 || cur->ByteLength < 0)
+                var ptr = this.pointers[i];
+                if (ptr.ByteOffset + ptr.ByteLength > this.data.Length)
                 {
-                    throw new ArgumentException();
+                    throw new ArgumentException($"Data for the string at index {i} is out-of-bounds (data is in range [{ptr.ByteOffset}, {ptr.ByteOffset + ptr.ByteLength}), but data length is only {data.Length} byte(s) long).");
                 }
 
-                long thisStringDataEnd = cur->ByteOffset + cur->ByteLength;
-                if (thisStringDataEnd > endOfStringData)
-                {
-                    endOfStringData = thisStringDataEnd;
-                }
-            }
-
-            var dataStart = (byte*)ptrsEnd;
-            var dataEnd = dataStart + endOfStringData;
-            if (this.data.Length < (dataEnd - head))
-            {
-                throw new ArgumentException();
+                // simply counting the chars is enough to engage the built-in validation logic
+                UTF8Encoding_NoBOM_ThrowOnInvalid.GetCharCount(&this.data.HeadPointer[ptr.ByteOffset], ptr.ByteLength);
             }
         }
 
-        [MethodImpl(MethodImplOptions.NoInlining)]
-        private static void ThrowArgumentOutOfRangeExceptionForIndex() => throw new ArgumentOutOfRangeException("idx", "Must be non-negative and less than the size of the array.");
-
         [StructLayout(LayoutKind.Sequential, Pack = 4)]
-        private struct StringPointer
+        public struct StringPointer
         {
             public long ByteOffset;
 
