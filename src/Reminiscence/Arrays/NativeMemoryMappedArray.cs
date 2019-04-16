@@ -94,7 +94,12 @@ namespace Reminiscence.Arrays
             }
         }
 
-        internal NativeMemoryMappedArray(FileStream fileStream) => this.fileStream = fileStream;
+        internal NativeMemoryMappedArray(FileStream fileStream, long length)
+        {
+            this.fileStream = fileStream;
+            this.LengthCore = length;
+            this.Initialize();
+        }
 
         /// <summary>
         /// Finalizes an instance of the <see cref="NativeMemoryMappedArray{T}"/> class.

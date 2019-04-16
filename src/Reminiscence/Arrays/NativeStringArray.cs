@@ -17,6 +17,8 @@ namespace Reminiscence.Arrays
 
         private bool disposed;
 
+        private bool repackWouldMakeChanges;
+
         public NativeStringArray(NativeMemoryArrayBase<StringPointer> pointers, NativeMemoryArrayBase<byte> data)
             : this(pointers ?? throw new ArgumentNullException(nameof(pointers)),
                    data ?? throw new ArgumentNullException(nameof(data)),
@@ -77,17 +79,53 @@ namespace Reminiscence.Arrays
                 var ptr = this.pointers[idx];
                 fixed (char* c = value)
                 {
+                    byte* dataStart = &this.data.HeadPointer[ptr.ByteOffset];
                     int neededByteLength = UTF8Encoding_NoBOM_ThrowOnInvalid.GetByteCount(c, value.Length);
-                    if (neededByteLength > ptr.ByteLength)
+
+                    // easiest case: encoded replacement is the same length as what we're replacing.
+                    if (neededByteLength == ptr.ByteLength)
                     {
-                        throw new NotImplementedException("still need to write the code to find a free block in the data array.");
+                        UTF8Encoding_NoBOM_ThrowOnInvalid.GetBytes(c, value.Length, dataStart, neededByteLength);
+                        return;
+                    }
+
+                    // almost as easy: encoded replacement is shorter than what we're replacing.
+                    if (neededByteLength < ptr.ByteLength)
+                    {
+                        this.repackWouldMakeChanges = true;
+                        ptr.ByteLength = UTF8Encoding_NoBOM_ThrowOnInvalid.GetBytes(c, value.Length, dataStart, ptr.ByteLength);
+                        this.pointers[idx] = ptr;
+                        return;
+                    }
+
+                    // hardest case by far: encoded replacement is longer than what we're replacing.
+                    long oldDataEnd;
+                    if (this.repackWouldMakeChanges)
+                    {
+                        oldDataEnd = this.Repack();
                     }
                     else
                     {
-                        byte* dataStart = &this.data.HeadPointer[ptr.ByteOffset];
-                        ptr.ByteLength = UTF8Encoding_NoBOM_ThrowOnInvalid.GetBytes(c, value.Length, dataStart, ptr.ByteLength);
-                        this.pointers[idx] = ptr;
+                        oldDataEnd = 0;
+                        for (long i = 0; i < this.pointers.Length; i++)
+                        {
+                            var ptr2 = this.pointers[i];
+                            if (oldDataEnd < ptr2.ByteOffset + ptr2.ByteLength)
+                            {
+                                oldDataEnd = ptr2.ByteOffset + ptr2.ByteLength;
+                            }
+                        }
                     }
+
+                    if (oldDataEnd + neededByteLength > this.data.Length)
+                    {
+                        this.data.EnsureMinimumSize(oldDataEnd + neededByteLength);
+                        this.repackWouldMakeChanges = true;
+                    }
+
+                    ptr.ByteOffset = oldDataEnd;
+                    UTF8Encoding_NoBOM_ThrowOnInvalid.GetBytes(c, value.Length, this.data.HeadPointer + ptr.ByteOffset, neededByteLength);
+                    this.pointers[idx] = ptr;
                 }
             }
         }
@@ -119,12 +157,40 @@ namespace Reminiscence.Arrays
         /// <inheritdoc />
         public override void Resize(long size) => this.pointers.Resize(size);
 
-        public unsafe void Repack(NativeMemoryArrayBase<byte> scratch)
+        // this method rewrites the string data so each string's data is located immediately after
+        // the data for the string before it (and, of course, rewrites the pointers accordingly).
+        // this will get rid of all fragmentation in the string data, but it's also possible that
+        // we will actually increase the size of the data, in cases where the data is optimized such
+        // that, e.g., "abcde" and "cdefg" point to sections of string data "abcdefg".  Such cases
+        // will be handled *correctly*, but without such optimizations.
+        public unsafe long Repack()
         {
-            scratch.Resize(this.data.Length);
-            scratch.CopyFrom(this.data);
+            long neededDataLength = 0;
+            for (long i = 0; i < this.pointers.Length; i++)
+            {
+                neededDataLength += this.pointers[i].ByteLength;
+            }
+
+            NativeMemoryMappedArray<byte> scratch;
+
+            var fileStream = new FileStream(Path.Combine(Path.GetTempPath(), Path.GetRandomFileName()), FileMode.Create, FileAccess.ReadWrite, FileShare.ReadWrite, 4096, FileOptions.DeleteOnClose);
             try
             {
+                fileStream.SetLength(this.data.Length);
+                scratch = new NativeMemoryMappedArray<byte>(fileStream, this.data.Length);
+            }
+            catch
+            {
+                fileStream.Dispose();
+                throw;
+            }
+
+            try
+            {
+                scratch.CopyFrom(this.data);
+
+                this.data.EnsureMinimumSize(neededDataLength);
+
                 byte* tgtPtr = this.data.HeadPointer;
                 for (long i = 0, cnt = this.Length; i < cnt; i++)
                 {
@@ -139,13 +205,17 @@ namespace Reminiscence.Arrays
                     tgtPtr += ptr.ByteLength;
                 }
 
-                this.data.Resize(tgtPtr - this.data.HeadPointer);
+                this.repackWouldMakeChanges = false;
+                return tgtPtr - this.data.HeadPointer;
             }
             catch
             {
-                this.data.Resize(scratch.Length);
                 this.data.CopyFrom(scratch);
                 throw;
+            }
+            finally
+            {
+                scratch.Dispose();
             }
         }
 
@@ -157,13 +227,9 @@ namespace Reminiscence.Arrays
                 throw new ArgumentNullException(nameof(stream));
             }
 
-            if (this.RepackBeforeSaving)
+            if (this.RepackBeforeSaving && this.repackWouldMakeChanges)
             {
-                using (var fileStream = new FileStream(Path.Combine(Path.GetTempPath(), Path.GetRandomFileName()), FileMode.Create, FileAccess.ReadWrite, FileShare.ReadWrite, 4096, FileOptions.DeleteOnClose))
-                using (var scratch = new NativeMemoryMappedArray<byte>(fileStream))
-                {
-                    this.Repack(scratch);
-                }
+                this.data.Resize(this.Repack());
             }
 
             long result = 0;
@@ -209,9 +275,15 @@ namespace Reminiscence.Arrays
 
         private unsafe void Validate()
         {
+            var prev = default(StringPointer);
             for (long i = 0; i < this.pointers.Length; i++)
             {
                 var ptr = this.pointers[i];
+                if (ptr.ByteOffset < 0 || ptr.ByteLength < 0)
+                {
+                    throw new ArgumentException("Offsets and lengths must be non-negative.", "pointers");
+                }
+
                 if (ptr.ByteOffset + ptr.ByteLength > this.data.Length)
                 {
                     throw new ArgumentException($"Data for the string at index {i} is out-of-bounds (data is in range [{ptr.ByteOffset}, {ptr.ByteOffset + ptr.ByteLength}), but data length is only {data.Length} byte(s) long).");
@@ -219,6 +291,10 @@ namespace Reminiscence.Arrays
 
                 // simply counting the chars is enough to engage the built-in validation logic
                 UTF8Encoding_NoBOM_ThrowOnInvalid.GetCharCount(&this.data.HeadPointer[ptr.ByteOffset], ptr.ByteLength);
+
+                // check if this string isn't snugly located immediately after the previous one.
+                this.repackWouldMakeChanges = this.repackWouldMakeChanges || ptr.ByteOffset != prev.ByteOffset + prev.ByteLength;
+                prev = ptr;
             }
         }
 
