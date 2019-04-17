@@ -76,11 +76,12 @@ namespace Reminiscence.Arrays
                     ThrowArgumentOutOfRangeExceptionForIndex();
                 }
 
+                int neededByteLength;
                 var ptr = this.pointers[idx];
                 fixed (char* c = value)
                 {
                     byte* dataStart = &this.data.HeadPointer[ptr.ByteOffset];
-                    int neededByteLength = UTF8Encoding_NoBOM_ThrowOnInvalid.GetByteCount(c, value.Length);
+                    neededByteLength = UTF8Encoding_NoBOM_ThrowOnInvalid.GetByteCount(c, value.Length);
 
                     // easiest case: encoded replacement is the same length as what we're replacing.
                     if (neededByteLength == ptr.ByteLength)
@@ -98,34 +99,59 @@ namespace Reminiscence.Arrays
                         return;
                     }
 
-                    // hardest case by far: encoded replacement is longer than what we're replacing.
-                    long oldDataEnd;
+                    // unpin it for now... I don't really want the string to be pinned for the whole
+                    // time we scan all the pointers, let alone the entire time we call Repack().
+                }
+
+                // hardest case by far: encoded replacement is longer than what we're replacing.
+                long dataEnd = 0;
+                long dataEndIdx = -1;
+                bool dataEndIsOverlapped = false;
+                for (long i = 0; i < this.pointers.Length; i++)
+                {
+                    var ptr2 = this.pointers[i];
+                    if (dataEnd <= ptr2.ByteOffset + ptr2.ByteLength)
+                    {
+                        dataEndIsOverlapped = dataEnd > ptr2.ByteOffset;
+                        dataEnd = ptr2.ByteOffset + ptr2.ByteLength;
+                        dataEndIdx = i;
+                    }
+                }
+
+                // if we happen to be setting the data for the string whose data is already at the
+                // very end, then we can safely reuse its old space as long as it's not something
+                // that's already been optimized to reuse runs of string data.
+                if (dataEndIdx == idx && !dataEndIsOverlapped)
+                {
+                    dataEnd -= ptr.ByteLength;
+                }
+
+                if (dataEnd + neededByteLength > this.data.Length)
+                {
                     if (this.repackWouldMakeChanges)
                     {
-                        oldDataEnd = this.Repack();
-                    }
-                    else
-                    {
-                        oldDataEnd = 0;
-                        for (long i = 0; i < this.pointers.Length; i++)
-                        {
-                            var ptr2 = this.pointers[i];
-                            if (oldDataEnd < ptr2.ByteOffset + ptr2.ByteLength)
-                            {
-                                oldDataEnd = ptr2.ByteOffset + ptr2.ByteLength;
-                            }
-                        }
+                        dataEnd = this.Repack();
                     }
 
-                    if (oldDataEnd + neededByteLength > this.data.Length)
+                    this.data.EnsureMinimumSize(dataEnd + neededByteLength);
+                }
+
+                ptr.ByteOffset = dataEnd;
+
+                fixed (char* c = value)
+                {
+                    UTF8Encoding_NoBOM_ThrowOnInvalid.GetBytes(c, value.Length, this.data.HeadPointer + ptr.ByteOffset, neededByteLength);
+                }
+
+                this.pointers[idx] = ptr;
+
+                if (!this.repackWouldMakeChanges && idx > 0)
+                {
+                    var prevPtr = this.pointers[idx - 1];
+                    if (prevPtr.ByteOffset + prevPtr.ByteLength != ptr.ByteOffset)
                     {
-                        this.data.EnsureMinimumSize(oldDataEnd + neededByteLength);
                         this.repackWouldMakeChanges = true;
                     }
-
-                    ptr.ByteOffset = oldDataEnd;
-                    UTF8Encoding_NoBOM_ThrowOnInvalid.GetBytes(c, value.Length, this.data.HeadPointer + ptr.ByteOffset, neededByteLength);
-                    this.pointers[idx] = ptr;
                 }
             }
         }
@@ -227,9 +253,13 @@ namespace Reminiscence.Arrays
                 throw new ArgumentNullException(nameof(stream));
             }
 
-            if (this.RepackBeforeSaving && this.repackWouldMakeChanges)
+            if (this.RepackBeforeSaving)
             {
-                this.data.Resize(this.Repack());
+                long newDataEnd = this.Repack();
+                if (newDataEnd != this.data.Length)
+                {
+                    this.data.Resize(newDataEnd);
+                }
             }
 
             long result = 0;
